@@ -1,0 +1,85 @@
+name: Publish TrendRadar candidate feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */2 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout publisher repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout TrendRadar
+        uses: actions/checkout@v4
+        with:
+          repository: sansan0/TrendRadar
+          path: .trendradar
+          fetch-depth: 1
+
+      - name: Set up Python and uv
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install TrendRadar dependencies
+        working-directory: .trendradar
+        run: uv sync --frozen --no-dev
+
+      - name: Disable paid and outbound features
+        working-directory: .trendradar
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          path = Path("config/config.yaml")
+          config = yaml.safe_load(path.read_text(encoding="utf-8"))
+          config.setdefault("notification", {})["enabled"] = False
+          config.setdefault("ai_analysis", {})["enabled"] = False
+          config.setdefault("ai_translation", {})["enabled"] = False
+          config.setdefault("storage", {})["backend"] = "local"
+          config.setdefault("storage", {}).setdefault("formats", {})["html"] = False
+          config.setdefault("storage", {}).setdefault("formats", {})["txt"] = False
+          path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+          PY
+
+      - name: Crawl TrendRadar
+        working-directory: .trendradar
+        run: uv run python -m trendradar
+
+      - name: Export candidate JSON
+        shell: bash
+        run: |
+          DB_PATH="$(find .trendradar/output/news -type f -name '*.db' | sort | tail -n 1)"
+          test -n "$DB_PATH"
+          python scripts/export_trendradar.py --db "$DB_PATH" --out trendradar.json
+
+      - name: Publish feed branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin trendradar-feed || true
+          if git show-ref --verify --quiet refs/remotes/origin/trendradar-feed; then
+            git checkout -B trendradar-feed origin/trendradar-feed
+          else
+            git checkout --orphan trendradar-feed
+            git rm -rf .
+          fi
+          cp "$GITHUB_WORKSPACE/trendradar.json" ./trendradar.json
+          git add trendradar.json
+          git commit -m "chore: update TrendRadar candidate feed" || true
+          git push origin HEAD:trendradar-feed
+
